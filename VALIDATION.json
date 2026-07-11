@@ -1,0 +1,53 @@
+[
+  {
+    "function": "auto-handverker-backup",
+    "bytes": 4691,
+    "env": [
+      "BACKUP_CRON_SECRET",
+      "SUPABASE_ANON_KEY",
+      "SUPABASE_SERVICE_ROLE_KEY",
+      "SUPABASE_URL"
+    ],
+    "vet_refs": []
+  },
+  {
+    "function": "daglig-hand-appfaktura",
+    "bytes": 94988,
+    "env": [
+      "BILLING_CRON_SECRET",
+      "SUPABASE_SERVICE_ROLE_KEY",
+      "SUPABASE_URL"
+    ],
+    "vet_refs": []
+  },
+  {
+    "function": "endrehandepost",
+    "bytes": 9727,
+    "env": [
+      "ENDREHANDEPOST",
+      "SUPABASE_SECRET_KEY",
+      "SUPABASE_SECRET_KEYS",
+      "SUPABASE_SERVICE_ROLE_KEY",
+      "SUPABASE_URL"
+    ],
+    "vet_refs": []
+  },
+  {
+    "function": "invite-hand-user",
+    "bytes": 3022,
+    "env": [
+      "SUPABASE_SERVICE_ROLE_KEY",
+      "SUPABASE_URL"
+    ],
+    "vet_refs": []
+  },
+  {
+    "function": "opprett-hand-kunde",
+    "bytes": 3312,
+    "env": [
+      "SUPABASE_SERVICE_ROLE_KEY",
+      "SUPABASE_URL"
+    ],
+    "vet_refs": []
+  }
+]
