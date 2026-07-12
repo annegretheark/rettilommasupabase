@@ -10,7 +10,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.45.4'
 import { PDFDocument, StandardFonts, rgb } from 'https://esm.sh/pdf-lib@1.17.1'
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? ''
-const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? Deno.env.get('HAND_SERVICE_ROLE_KEY') ?? ''
 const BILLING_CRON_SECRET = Deno.env.get('BILLING_CRON_SECRET') ?? ''
 const BUCKET = 'hand-firma-faktura'
 const FOLDER = 'handverker/fakturaer'
@@ -702,10 +702,78 @@ async function authorizeBillingRequest(req: Request, body: any) {
   if (!token) throw new Error('Mangler autorisering for fakturafunksjonen')
   const { data, error } = await sb.auth.getUser(token)
   if (error || !data?.user) throw new Error('Ugyldig innlogging')
-  const email = String(data.user.email || '').toLowerCase()
-  const { data: sysadm } = await sb.from('hand_sysadm').select('aktiv').ilike('epost', email).eq('aktiv', true).limit(1).maybeSingle()
-  if (!sysadm) throw new Error('Kun systemadministrator kan kjøre fakturafunksjonen manuelt')
-  return { mode: 'user', email }
+  const email = String(data.user.email || '').trim().toLowerCase()
+  const userId = String(data.user.id || '')
+
+  // Fast systemeier: Greknuts skal alltid ha SysAdm-tilgang, uavhengig av
+  // hvordan rollen er lagret i databasen. Dette hindrer at forskjeller i
+  // kolonnenavn, RLS eller gamle sysadm-rader blokkerer fakturafunksjonen.
+  if (email === SYSADM_EMAIL) {
+    return { mode: 'user', email, role: 'sysadm' }
+  }
+
+  // Global SysAdm kan alltid kjøre fakturafunksjonen manuelt.
+  const { data: sysadm } = await sb
+    .from('hand_sysadm')
+    .select('aktiv')
+    .ilike('epost', email)
+    .eq('aktiv', true)
+    .limit(1)
+    .maybeSingle()
+
+  if (sysadm) return { mode: 'user', email, role: 'sysadm' }
+
+  // Firmaadministrator/eier skal ogsa kunne kjore funksjonen.
+  // Vi sjekker bade hand_firma_bruker og hand_ansatt fordi eldre data kan ligge i en av tabellene.
+  const adminRoles = new Set(['admin', 'administrator', 'eier', 'owner', 'firmaeier', 'sysadm', 'sysadmin', 'systemadmin'])
+
+  let firmaBrukerAdmin = false
+  const { data: firmaBrukere } = await sb
+    .from('hand_firma_bruker')
+    .select('*')
+    .ilike('epost', email)
+    .limit(20)
+
+  firmaBrukerAdmin = (firmaBrukere || []).some((row: any) => {
+    const rolle = String(row?.rolle || '').trim().toLowerCase()
+    const aktiv = row?.aktiv !== false
+    return aktiv && adminRoles.has(rolle)
+  })
+
+  if (!firmaBrukerAdmin && userId) {
+    const { data: firmaBrukereUid } = await sb
+      .from('hand_firma_bruker')
+      .select('*')
+      .eq('user_id', userId)
+      .limit(20)
+
+    firmaBrukerAdmin = (firmaBrukereUid || []).some((row: any) => {
+      const rolle = String(row?.rolle || '').trim().toLowerCase()
+      const aktiv = row?.aktiv !== false
+      return aktiv && adminRoles.has(rolle)
+    })
+  }
+
+  let ansattAdmin = false
+  if (!firmaBrukerAdmin) {
+    const { data: ansatte } = await sb
+      .from('hand_ansatt')
+      .select('*')
+      .ilike('epost', email)
+      .limit(20)
+
+    ansattAdmin = (ansatte || []).some((row: any) => {
+      const rolle = String(row?.rolle || '').trim().toLowerCase()
+      const aktiv = row?.aktiv !== false
+      return aktiv && (row?.er_admin === true || adminRoles.has(rolle))
+    })
+  }
+
+  if (!firmaBrukerAdmin && !ansattAdmin) {
+    throw new Error('Kun SysAdm eller administrator kan kjore fakturafunksjonen manuelt')
+  }
+
+  return { mode: 'user', email, role: 'admin' }
 }
 
 Deno.serve(async (req) => {
@@ -713,7 +781,7 @@ Deno.serve(async (req) => {
     return new Response('ok', { headers: CORS_HEADERS })
   }
   try {
-    if (!SUPABASE_URL || !SERVICE_ROLE_KEY) throw new Error('Mangler SUPABASE_URL eller SUPABASE_SERVICE_ROLE_KEY')
+    if (!SUPABASE_URL || !SERVICE_ROLE_KEY) throw new Error('Mangler SUPABASE_URL eller service-role-nokkel (SUPABASE_SERVICE_ROLE_KEY / HAND_SERVICE_ROLE_KEY)')
     const body = await req.json().catch(() => ({}))
     await authorizeBillingRequest(req, body)
     const action = body.action ?? 'daily' // daily er standard og kan kjøres av cron hver dag
@@ -723,7 +791,12 @@ Deno.serve(async (req) => {
         .from(FIRMA_TABLE)
         .select('*')
         .limit(2000)
-      if (firmaError) throw firmaError
+      if (firmaError) {
+        if (String(firmaError.message || '').toLowerCase().includes('permission denied')) {
+          throw new Error('Service-role-nokkelen mangler databaseadgang til hand_firma. Sett HAND_SERVICE_ROLE_KEY til prosjektets ekte service_role key og deploy funksjonen pa nytt.')
+        }
+        throw firmaError
+      }
 
       const { data: fakturaer, error: fakturaError } = await sb
         .from(INVOICE_TABLE)
@@ -794,22 +867,41 @@ Deno.serve(async (req) => {
       .neq('abonnement_status', 'deaktivert')
     if (error) throw error
 
-    const results = []
+    const results: any[] = []
     const today = body.date ?? isoDate()
     const sender = await getGreknutsSenderFirma()
+
+    // Behandle hvert firma separat. Tidligere stoppet hele faktureringen ved den
+    // første database-, PDF- eller storage-feilen, og da kunne bare én faktura
+    // bli opprettet selv om flere firma skulle faktureres.
     for (const firma of firmaer ?? []) {
       if (isSysadmFirma(firma)) {
         results.push({ created: false, reason: 'sysadm_sender_not_customer', firma_id: firma.id, epost: firma.epost })
         continue
       }
-      results.push(await dailyCheckFirma({ ...firma, _sender: sender }, today))
+
+      try {
+        const result = await dailyCheckFirma({ ...firma, _sender: sender }, today)
+        results.push({ ...result, firma_id: firma.id, epost: firma.epost })
+      } catch (firmaError) {
+        console.error('Fakturering feilet for firma', firma?.id, firma?.epost, firmaError)
+        results.push({
+          created: false,
+          reason: 'firma_error',
+          firma_id: firma?.id ?? null,
+          epost: firma?.epost ?? '',
+          error: firmaError?.message ?? String(firmaError),
+        })
+      }
     }
 
     return jsonResponse({
       ok: true,
       checked_count: results.length,
       created_count: results.filter(r => r.created).length,
-      skipped_count: results.filter(r => !r.created).length,
+      skipped_count: results.filter(r => !r.created && !r.error).length,
+      error_count: results.filter(r => !!r.error).length,
+      errors: results.filter(r => !!r.error),
       results,
     })
   } catch (e) {
