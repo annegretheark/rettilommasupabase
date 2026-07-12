@@ -27,6 +27,9 @@ function getServiceKey(): string {
     return keys.default || Object.values(keys)[0] || "";
   } catch (_) { return ""; }
 }
+function isColumnError(error: unknown): boolean {
+  return /column|schema cache|Could not find|does not exist|PGRST/i.test(String((error as any)?.message || error || ""));
+}
 
 async function findAuthUserIdByEmail(admin: any, email: string): Promise<string> {
   email = norm(email);
@@ -56,7 +59,7 @@ async function requesterIsSysadmin(admin: any, email: string): Promise<boolean> 
   return false;
 }
 
-async function requesterIsAdmin(admin: any, requesterId: string, requesterEmail: string): Promise<{ok:boolean; source:string; role:string}> {
+async function requesterIsAdmin(admin: any, requesterId: string, requesterEmail: string): Promise<{ok:boolean; source:string; role:string; sysadmin:boolean}> {
   const checks: Array<{table:string; column:string; value:string}> = [];
   if (requesterId) {
     checks.push({ table: "hand_firma_bruker", column: "user_id", value: requesterId });
@@ -76,11 +79,35 @@ async function requesterIsAdmin(admin: any, requesterId: string, requesterEmail:
     const r = data[0] || {};
     const inactive = r.aktiv === false || r.active === false || r.deaktivert === true;
     const role = norm(r.rolle || r.role);
-    if (!inactive && ADMIN_ROLES.has(role)) return { ok: true, source: `${c.table}.${c.column}`, role };
+    if (!inactive && ADMIN_ROLES.has(role)) return { ok: true, source: `${c.table}.${c.column}`, role, sysadmin: false };
   }
 
-  if (await requesterIsSysadmin(admin, requesterEmail)) return { ok: true, source: "hand_sysadmin", role: "sysadm" };
-  return { ok: false, source: "", role: "" };
+  if (await requesterIsSysadmin(admin, requesterEmail)) return { ok: true, source: "hand_sysadmin", role: "sysadm", sysadmin: true };
+  return { ok: false, source: "", role: "", sysadmin: false };
+}
+
+async function readFirma(admin: any, firmaId: string): Promise<any> {
+  for (const cols of ["id,epost,email", "id,epost", "id,email", "id"]) {
+    const r = await admin.from("hand_firma").select(cols).eq("id", firmaId).maybeSingle();
+    if (!r.error) return r.data;
+    if (!isColumnError(r.error)) throw r.error;
+  }
+  return null;
+}
+
+async function readFirmaBrukere(admin: any, firmaId: string): Promise<any[]> {
+  const r = await admin.from("hand_firma_bruker").select("*").eq("firma_id", firmaId);
+  if (r.error) throw r.error;
+  return Array.isArray(r.data) ? r.data : [];
+}
+
+async function patchFirmaEmail(admin: any, firmaId: string, newEmail: string): Promise<string | null> {
+  for (const patch of [{ epost: newEmail }, { email: newEmail }]) {
+    const r = await admin.from("hand_firma").update(patch).eq("id", firmaId);
+    if (!r.error) return null;
+    if (!isColumnError(r.error)) return String(r.error.message || r.error);
+  }
+  return "Fant ikke epost- eller email-kolonne i hand_firma.";
 }
 
 Deno.serve(async (req: Request) => {
@@ -98,10 +125,14 @@ Deno.serve(async (req: Request) => {
   try {
     const body = await req.json().catch(() => ({}));
     const ansattId = raw(body.ansatt_id || body.ansattId);
+    const firmaId = raw(body.firma_id || body.firmaId);
     const newEmail = norm(body.new_email || body.nyEpost || body.newEmail);
-    const oldEmail = norm(body.old_email || body.gammelEpost || body.oldEmail);
+    const oldEmailFromClient = norm(body.old_email || body.gammelEpost || body.oldEmail);
     let authUserId = raw(body.user_id || body.userId);
-    if (!ansattId || !newEmail) return json(400, { ok: false, error: "Mangler ansatt_id eller new_email." });
+
+    if ((!ansattId && !firmaId) || !newEmail) {
+      return json(400, { ok: false, error: "Mangler ansatt_id eller firma_id, eller new_email." });
+    }
 
     const { data: requesterData, error: requesterError } = await admin.auth.getUser(accessToken);
     if (requesterError || !requesterData?.user) return json(401, { ok: false, error: "Kunne ikke lese innlogget bruker fra token.", details: requesterError?.message || null });
@@ -113,51 +144,99 @@ Deno.serve(async (req: Request) => {
       ok: false,
       error: "Innlogget bruker er ikke admin i hand_firma_bruker eller hand_ansatt.",
       requester_id: requesterId,
-      requester_email: requesterEmail,
-      checked: ["hand_firma_bruker.user_id", "hand_firma_bruker.epost", "hand_ansatt.user_id", "hand_ansatt.epost", "hand_sysadmin"]
+      requester_email: requesterEmail
     });
 
-    // Les hand_ansatt robust: noen databaser mangler email og/eller user_id.
-    // Supabase feiler hele selecten hvis en valgt kolonne ikke finnes, derfor prøver vi smalere selects.
+    // FIRMA: finn firmaets admin/eier i hand_firma_bruker, og oppdater denne Auth-brukeren.
+    if (firmaId) {
+      const firma = await readFirma(admin, firmaId);
+      if (!firma) return json(404, { ok: false, error: "Fant ikke firma i hand_firma.", firma_id: firmaId });
+
+      const firmaBrukere = await readFirmaBrukere(admin, firmaId);
+      const adminRows = firmaBrukere.filter((r: any) => ADMIN_ROLES.has(norm(r.rolle || r.role)) && r.aktiv !== false && r.active !== false);
+      const candidates = adminRows.length ? adminRows : firmaBrukere;
+      const oldEmail = oldEmailFromClient || norm(firma.epost || firma.email);
+      const owner = candidates.find((r: any) => authUserId && raw(r.user_id || r.auth_user_id) === authUserId)
+        || candidates.find((r: any) => oldEmail && norm(r.epost || r.email) === oldEmail)
+        || candidates[0]
+        || null;
+
+      authUserId = authUserId || raw(owner?.user_id || owner?.auth_user_id);
+      if (!authUserId) authUserId = await findAuthUserIdByEmail(admin, oldEmail || norm(owner?.epost || owner?.email));
+      if (!authUserId) return json(409, {
+        ok: false,
+        error: "Fant ikke firmaets Supabase Auth-bruker. Sjekk hand_firma_bruker.user_id eller gammel e-post.",
+        firma_id: firmaId,
+        old_email: oldEmail || null
+      });
+
+      const { error: updateError } = await admin.auth.admin.updateUserById(authUserId, { email: newEmail, email_confirm: true });
+      if (updateError) return json(500, { ok: false, error: "Auth kunne ikke oppdateres.", details: updateError.message, user_id: authUserId, firma_id: firmaId });
+
+      const { data: verifyData, error: verifyError } = await admin.auth.admin.getUserById(authUserId);
+      if (verifyError || norm(verifyData?.user?.email) !== newEmail) {
+        return json(500, { ok: false, error: "Auth-oppdatering ble ikke verifisert.", details: verifyError?.message || null, auth_email: verifyData?.user?.email || null });
+      }
+
+      const firmaWarning = await patchFirmaEmail(admin, firmaId, newEmail);
+      let brukerWarning: string | null = null;
+      let brukerUpdated = false;
+
+      const patches = [{ epost: newEmail, user_id: authUserId }, { epost: newEmail }, { email: newEmail, user_id: authUserId }, { email: newEmail }];
+      for (const patch of patches) {
+        let q = admin.from("hand_firma_bruker").update(patch);
+        q = owner?.id ? q.eq("id", owner.id) : q.eq("user_id", authUserId);
+        const r = await q;
+        if (!r.error) { brukerUpdated = true; brukerWarning = null; break; }
+        brukerWarning = String(r.error.message || r.error);
+        if (!isColumnError(r.error)) break;
+      }
+      if (!brukerUpdated && oldEmail) {
+        const r = await admin.from("hand_firma_bruker").update({ epost: newEmail, user_id: authUserId }).eq("firma_id", firmaId).ilike("epost", oldEmail);
+        if (!r.error) { brukerUpdated = true; brukerWarning = null; }
+        else brukerWarning = String(r.error.message || r.error);
+      }
+
+      return json(200, {
+        ok: true,
+        mode: "firma",
+        authUpdated: true,
+        firmaUpdated: !firmaWarning,
+        firmaBrukerUpdated: brukerUpdated,
+        firma_id: firmaId,
+        user_id: authUserId,
+        auth_email: newEmail,
+        admin_source: adminCheck.source,
+        admin_role: adminCheck.role,
+        hand_firma_warning: firmaWarning,
+        hand_firma_bruker_warning: brukerWarning
+      });
+    }
+
+    // ANSATT: behold eksisterende og fungerende ansatte-flyt.
     let ansatt: any = null;
     let ansattError: any = null;
     for (const cols of ["id,user_id,epost,email", "id,user_id,epost", "id,epost,email", "id,epost", "id"]) {
       const r = await admin.from("hand_ansatt").select(cols).eq("id", ansattId).maybeSingle();
       if (!r.error) { ansatt = r.data; ansattError = null; break; }
       ansattError = r.error;
-      const msg = String(r.error.message || "");
-      if (!/column|schema cache|Could not find|does not exist|PGRST/i.test(msg)) break;
+      if (!isColumnError(r.error)) break;
     }
-    // Ikke stopp her hvis hand_ansatt ikke kan leses. På noen installasjoner har tabellen
-    // annen RLS/skjema/cache enn forventet. Vi kan fortsatt oppdatere Supabase Auth når
-    // klienten sender user_id eller gammel e-post. Tabellen oppdateres best-effort etterpå.
     const ansattReadWarning = ansattError ? String(ansattError.message || ansattError) : (!ansatt ? "Fant ikke ansatt i hand_ansatt." : "");
 
     authUserId = authUserId || raw(ansatt?.user_id);
-    if (!authUserId) authUserId = await findAuthUserIdByEmail(admin, oldEmail || ansatt?.epost || ansatt?.email);
+    if (!authUserId) authUserId = await findAuthUserIdByEmail(admin, oldEmailFromClient || ansatt?.epost || ansatt?.email);
     if (!authUserId) return json(409, {
       ok: false,
       error: "Fant ikke Supabase Auth-bruker. Send user_id fra klienten eller sjekk gammel e-post.",
       ansatt_id: ansattId,
-      old_email: oldEmail || null,
+      old_email: oldEmailFromClient || null,
       ansatt_email: ansatt?.epost || ansatt?.email || null,
       hand_ansatt_warning: ansattReadWarning || null
     });
 
-    const { error: updateError } = await admin.auth.admin.updateUserById(authUserId, {
-      email: newEmail,
-      email_confirm: true
-    });
-    if (updateError) return json(500, {
-      ok: false,
-      error: "Auth kunne ikke oppdateres.",
-      details: updateError.message,
-      user_id: authUserId,
-      ansatt_id: ansattId,
-      requested_email: newEmail,
-      admin_source: adminCheck.source,
-      admin_role: adminCheck.role
-    });
+    const { error: updateError } = await admin.auth.admin.updateUserById(authUserId, { email: newEmail, email_confirm: true });
+    if (updateError) return json(500, { ok: false, error: "Auth kunne ikke oppdateres.", details: updateError.message, user_id: authUserId, ansatt_id: ansattId });
 
     const { data: verifyData, error: verifyError } = await admin.auth.admin.getUserById(authUserId);
     if (verifyError || norm(verifyData?.user?.email) !== newEmail) {
@@ -170,17 +249,15 @@ Deno.serve(async (req: Request) => {
       const r = await admin.from("hand_ansatt").update(patch).eq("id", ansattId);
       if (!r.error) { patchAnsattError = null; ansattUpdated = true; break; }
       patchAnsattError = r.error;
-      const msg = String(r.error.message || "");
-      if (!/column|schema cache|Could not find|does not exist|PGRST/i.test(msg)) break;
+      if (!isColumnError(r.error)) break;
     }
 
-    // Auth er viktigst. Ikke returner feil etter vellykket Auth-oppdatering bare fordi
-    // hand_ansatt ikke kan patches; klienten lagrer hand_ansatt etterpå.
     const firma1 = await admin.from("hand_firma_bruker").update({ epost: newEmail }).eq("user_id", authUserId);
-    if (oldEmail) await admin.from("hand_firma_bruker").update({ epost: newEmail, user_id: authUserId }).ilike("epost", oldEmail);
+    if (oldEmailFromClient) await admin.from("hand_firma_bruker").update({ epost: newEmail, user_id: authUserId }).ilike("epost", oldEmailFromClient);
 
     return json(200, {
       ok: true,
+      mode: "ansatt",
       authUpdated: true,
       ansattUpdated,
       user_id: authUserId,
