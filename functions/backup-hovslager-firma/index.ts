@@ -13,7 +13,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-cron-secret",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
@@ -55,7 +55,7 @@ const RESTORE_ORDER = [
   "hov_innstillinger",
 ];
 
-const DELETE_ORDER = [...RESTORE_ORDER].reverse();
+const DELETE_ORDER = RESTORE_ORDER.filter((tableName) => tableName !== "hov_firma").reverse();
 const IMAGE_TABLES = ["hov_jobb_bilder", "hov_hest_bilder"];
 
 const IMAGE_BUCKET_CANDIDATES = [
@@ -287,7 +287,13 @@ async function backupOneFirma(supabase: any, firma: any, stamp: string) {
 
   if (uploadError) throw new Error(`Storage upload feilet for ${firmaId}: ${uploadError.message}`);
 
+  const signed = await supabase.storage.from(BACKUP_BUCKET).createSignedUrl(jsonPath, 60 * 60);
+
   return {
+    ok: true,
+    backup_scope: "firma",
+    backup_type: "firma",
+    bucket: BACKUP_BUCKET,
     firma_id: firmaId,
     firma_navn: firmaNavn,
     path: jsonPath,
@@ -298,6 +304,7 @@ async function backupOneFirma(supabase: any, firma: any, stamp: string) {
     storrelse_kb: Math.ceil(bytes / 1024),
     created_at: (backup as any).created_at,
     created_at_oslo: stamp,
+    signed_url: signed.data?.signedUrl || null,
     summary,
   };
 }
@@ -343,24 +350,106 @@ function parseFirmaIdFromPath(path: string): string | null {
   return m ? m[1] : null;
 }
 
-async function firmaIdFromRequest(supabase: any, req: Request): Promise<string | null> {
+type AuthContext = {
+  authenticated: boolean;
+  userId: string | null;
+  firmaId: string | null;
+  role: string | null;
+  isSysadm: boolean;
+};
+
+function normalizeRole(value: unknown): string {
+  return String(value || "").trim().toLowerCase();
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  const aa = new TextEncoder().encode(a);
+  const bb = new TextEncoder().encode(b);
+  if (aa.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < aa.length; i++) diff |= aa[i] ^ bb[i];
+  return diff === 0;
+}
+
+function isValidCronRequest(req: Request): boolean {
+  const configured = Deno.env.get("BACKUP_CRON_SECRET") || "";
+  const supplied = req.headers.get("x-cron-secret") || "";
+  if (configured && supplied && constantTimeEqual(configured, supplied)) {
+    return true;
+  }
+
+  const serviceRole =
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ||
+    Deno.env.get("APP_SERVICE_ROLE_KEY") ||
+    "";
+
+  const auth =
+    req.headers.get("Authorization") ||
+    req.headers.get("authorization") ||
+    "";
+
+  const bearer = auth.replace(/^Bearer\s+/i, "").trim();
+
+  return Boolean(
+    serviceRole &&
+    bearer &&
+    constantTimeEqual(serviceRole, bearer)
+  );
+}
+
+async function authContextFromRequest(supabase: any, req: Request): Promise<AuthContext> {
   const auth = req.headers.get("Authorization") || req.headers.get("authorization") || "";
   const token = auth.replace(/^Bearer\s+/i, "").trim();
-  if (!token) return null;
+  if (!token) return { authenticated: false, userId: null, firmaId: null, role: null, isSysadm: false };
 
   const { data: userData, error: userError } = await supabase.auth.getUser(token);
   const userId = userData?.user?.id || null;
-  if (userError || !userId) return null;
+  if (userError || !userId) return { authenticated: false, userId: null, firmaId: null, role: null, isSysadm: false };
 
-  const pr = await supabase.from("hov_profiles").select("firma_id, rolle").eq("auth_user_id", userId).maybeSingle();
-  if (pr.data?.firma_id) return pr.data.firma_id;
+  const profile = await supabase
+    .from("hov_profiles")
+    .select("firma_id, rolle")
+    .eq("auth_user_id", userId)
+    .maybeSingle();
 
-  const fr = await supabase.from("hov_firma").select("id").eq("auth_user_id", userId).maybeSingle();
-  return fr.data?.id || null;
+  const role = normalizeRole(profile.data?.rolle || "hovslager");
+  if (role === "deaktivert") throw new Error("Brukeren er deaktivert");
+
+  let firmaId = profile.data?.firma_id || null;
+  if (!firmaId) {
+    const firma = await supabase.from("hov_firma").select("id").eq("auth_user_id", userId).maybeSingle();
+    firmaId = firma.data?.id || null;
+  }
+
+  return {
+    authenticated: true,
+    userId,
+    firmaId,
+    role,
+    isSysadm: role === "sysadm",
+  };
 }
 
-async function listBackups(supabase: any, body: any, req: Request) {
-  const firmaId = body?.firma_id || body?.firmaId || body?.firmaID || await firmaIdFromRequest(supabase, req);
+function requestedFirmaId(body: any): string | null {
+  const value = body?.firma_id || body?.firmaId || body?.firmaID || null;
+  return value ? String(value) : null;
+}
+
+function authorizedFirmaId(ctx: AuthContext, body: any): string {
+  if (!ctx.authenticated) throw new Error("Du må være innlogget");
+  const requested = requestedFirmaId(body);
+  if (ctx.isSysadm) {
+    const id = requested || ctx.firmaId;
+    if (!id) throw new Error("Mangler firma_id");
+    return id;
+  }
+  if (!ctx.firmaId) throw new Error("Brukeren er ikke koblet til et firma");
+  if (requested && requested !== ctx.firmaId) throw new Error("Ingen tilgang til valgt firma");
+  return ctx.firmaId;
+}
+
+async function listBackups(supabase: any, body: any, ctx: AuthContext) {
+  const firmaId = authorizedFirmaId(ctx, body);
   if (!firmaId) {
     return { ok: false, error: "Mangler firma_id for liste" };
   }
@@ -463,16 +552,32 @@ async function restoreRows(supabase: any, tableName: string, rows: any[]) {
   return { rows: rows.length, method: "insert" };
 }
 
-async function restoreBackup(supabase: any, body: any) {
+function validateBackupRows(backup: any, firmaId: string) {
+  for (const tableName of HOV_TABLES) {
+    for (const row of tableRows(backup, tableName)) {
+      if (tableName === "hov_firma") {
+        if (String(row?.id || "") !== firmaId) throw new Error(`Ugyldig firma-rad i ${tableName}`);
+      } else if (String(row?.firma_id || "") !== firmaId) {
+        throw new Error(`Backup inneholder rad fra annet firma i ${tableName}`);
+      }
+    }
+  }
+}
+
+async function restoreBackup(supabase: any, body: any, ctx: AuthContext) {
+  if (body?.confirm !== true) throw new Error("Restore krever confirm: true");
   const backupPath = body?.backup_path || body?.backupPath || body?.path || body?.file_path || body?.filePath || body?.filsti || body?.file;
   if (!backupPath) throw new Error("Mangler backup_path");
 
   const { backup, cleanPath } = await downloadBackupJson(supabase, backupPath);
   const firmaId = String(backup.firma_id);
+  const allowedFirmaId = authorizedFirmaId(ctx, { firma_id: firmaId });
+  if (allowedFirmaId !== firmaId) throw new Error("Ingen tilgang til backupens firma");
   const pathFirmaId = parseFirmaIdFromPath(cleanPath);
-  if (pathFirmaId && pathFirmaId !== firmaId) {
+  if (!pathFirmaId || pathFirmaId !== firmaId) {
     throw new Error("backup_path og backupfil har ulik firma_id");
   }
+  validateBackupRows(backup, firmaId);
 
   const deleted: Record<string, unknown> = {};
   for (const tableName of DELETE_ORDER) {
@@ -517,18 +622,44 @@ serve(async (req) => {
     const supabase = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
     const body = await req.json().catch(() => ({}));
     const action = String(body?.action || "backup").toLowerCase();
+    const cronRequest = isValidCronRequest(req);
+    const ctx = cronRequest
+      ? { authenticated: false, userId: null, firmaId: null, role: "cron", isSysadm: false }
+      : await authContextFromRequest(supabase, req);
 
     if (action === "list") {
-      return jsonResponse(await listBackups(supabase, body, req));
+      if (cronRequest) return jsonResponse({ ok: false, error: "Cron kan ikke liste backups" }, 403);
+      return jsonResponse(await listBackups(supabase, body, ctx));
     }
 
     if (action === "restore") {
-      return jsonResponse(await restoreBackup(supabase, body));
+      if (cronRequest) return jsonResponse({ ok: false, error: "Cron kan ikke kjøre restore" }, 403);
+      return jsonResponse(await restoreBackup(supabase, body, ctx));
     }
 
-    // Nattbackup skal som standard ta alle firmaer. Body ignoreres for backup.
-    const result = await runNightBackupAllFirms(supabase);
-    return jsonResponse(result, result.ok ? 200 : 207);
+    const scope = String(body?.scope || "firma").toLowerCase();
+    if (cronRequest) {
+      const result = await runNightBackupAllFirms(supabase);
+      return jsonResponse(result, result.ok ? 200 : 207);
+    }
+
+    if (!ctx.authenticated) return jsonResponse({ ok: false, error: "Du må være innlogget" }, 401);
+
+    if (scope === "system") {
+      if (!ctx.isSysadm) return jsonResponse({ ok: false, error: "Bare sysadm kan ta systembackup" }, 403);
+      const result = await runNightBackupAllFirms(supabase);
+      return jsonResponse(result, result.ok ? 200 : 207);
+    }
+
+    const firmaId = authorizedFirmaId(ctx, body);
+    const { data: firma, error: firmaError } = await supabase
+      .from("hov_firma")
+      .select("id, navn, epost, linknavn")
+      .eq("id", firmaId)
+      .maybeSingle();
+    if (firmaError || !firma) throw new Error(`Fant ikke firma: ${firmaError?.message || firmaId}`);
+
+    return jsonResponse(await backupOneFirma(supabase, firma, osloStamp()));
   } catch (err) {
     return jsonResponse({ ok: false, error: err instanceof Error ? err.message : String(err) }, 500);
   }

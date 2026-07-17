@@ -1,5 +1,8 @@
 // Supabase Edge Function: opprett-hov-kunde
-// Idempotent versjon: feiler ikke hvis Auth-bruker eller hov_firma allerede finnes.
+// Oppretter/oppdaterer firma, sender første invitasjon og kan sende invitasjon på nytt.
+// Modi:
+//   mode: "opprett"              -> lagre firma + send første invitasjon
+//   mode: "send_invite_pa_nytt" -> send ny invitasjon til eksisterende firma
 // Krever secrets:
 // - SUPABASE_URL eller APP_SUPABASE_URL
 // - SERVICE_ROLE_KEY eller SUPABASE_SERVICE_ROLE_KEY eller APP_SERVICE_ROLE_KEY
@@ -16,15 +19,12 @@ const corsHeaders = {
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body, null, 2), {
     status,
-    headers: {
-      ...corsHeaders,
-      "Content-Type": "application/json",
-    },
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 }
 
-function slugify(v: string) {
-  return String(v || "")
+function slugify(value: string) {
+  return String(value || "")
     .trim()
     .toLowerCase()
     .normalize("NFD")
@@ -36,48 +36,152 @@ function slugify(v: string) {
     .replace(/^-+|-+$/g, "");
 }
 
-function fjernManglendeKolonne(payload: Record<string, unknown>, error: unknown) {
-  const msg = String((error as any)?.message || "");
-  const treff =
-    msg.match(/'([^']+)' column/) ||
-    msg.match(/column "([^"]+)"/i) ||
-    msg.match(/Could not find the '([^']+)' column/i);
-
-  if (treff?.[1] && Object.prototype.hasOwnProperty.call(payload, treff[1])) {
-    delete payload[treff[1]];
-    return true;
-  }
-  return false;
+function manglendeKolonne(error: unknown): string | null {
+  const message = String((error as any)?.message || "");
+  const match =
+    message.match(/'([^']+)' column/) ||
+    message.match(/column "([^"]+)"/i) ||
+    message.match(/Could not find the '([^']+)' column/i);
+  return match?.[1] || null;
 }
 
-async function finnAuthUserId(admin: any, email: string): Promise<string | null> {
-  // Supabase Admin API har ikke alltid direkte lookup-by-email i alle miljøer.
-  // Vi lister i små sider og leter etter e-post.
-  try {
-    for (let page = 1; page <= 20; page++) {
-      const { data, error } = await admin.auth.admin.listUsers({
-        page,
-        perPage: 100,
-      });
+async function finnAuthBruker(admin: any, email: string): Promise<any | null> {
+  for (let page = 1; page <= 50; page++) {
+    const { data, error } = await admin.auth.admin.listUsers({ page, perPage: 100 });
+    if (error) throw error;
 
-      if (error) {
-        console.warn("Kunne ikke liste Auth-brukere:", error.message);
-        return null;
-      }
+    const users = data?.users || [];
+    const user = users.find(
+      (item: any) => String(item?.email || "").toLowerCase() === email.toLowerCase(),
+    );
 
-      const users = data?.users || [];
-      const funnet = users.find((u: any) =>
-        String(u?.email || "").toLowerCase() === email.toLowerCase()
-      );
+    if (user) return user;
+    if (users.length < 100) break;
+  }
+  return null;
+}
 
-      if (funnet?.id) return funnet.id;
-      if (users.length < 100) break;
-    }
-  } catch (e) {
-    console.warn("Auth lookup hoppet over:", e);
+async function finnFirma(admin: any, firmaId: string, epost: string, linknavn: string) {
+  if (firmaId) {
+    const { data, error } = await admin
+      .from("hov_firma")
+      .select("*")
+      .eq("id", firmaId)
+      .maybeSingle();
+    if (error) throw error;
+    if (data) return data;
   }
 
-  return null;
+  const filters: string[] = [];
+  if (epost) filters.push(`epost.ilike.${epost}`);
+  if (linknavn) filters.push(`linknavn.eq.${linknavn}`);
+  if (!filters.length) return null;
+
+  const { data, error } = await admin
+    .from("hov_firma")
+    .select("*")
+    .or(filters.join(","))
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data || null;
+}
+
+async function lagreFirma(
+  admin: any,
+  eksisterendeFirma: any,
+  values: { navn: string; epost: string; linknavn: string; authUserId?: string | null },
+) {
+  let payload: Record<string, unknown> = {
+    navn: values.navn,
+    epost: values.epost,
+    linknavn: values.linknavn,
+    rolle: "admin",
+    er_admin: true,
+  };
+
+  if (values.authUserId !== undefined) {
+    payload.auth_user_id = values.authUserId;
+  }
+
+  for (let forsok = 0; forsok < 10; forsok++) {
+    const query = eksisterendeFirma?.id
+      ? admin.from("hov_firma").update(payload).eq("id", eksisterendeFirma.id)
+      : admin.from("hov_firma").insert([payload]);
+
+    const { data, error } = await query.select("*").maybeSingle();
+    if (!error) return data;
+
+    const kolonne = manglendeKolonne(error);
+    if (!kolonne || !Object.prototype.hasOwnProperty.call(payload, kolonne)) throw error;
+    delete payload[kolonne];
+  }
+
+  throw new Error("Kunne ikke lagre hov_firma.");
+}
+
+async function oppdaterFirmaAuthId(admin: any, firmaId: string, authUserId: string | null) {
+  if (!firmaId || !authUserId) return;
+
+  let payload: Record<string, unknown> = { auth_user_id: authUserId };
+  for (let forsok = 0; forsok < 3; forsok++) {
+    const { error } = await admin.from("hov_firma").update(payload).eq("id", firmaId);
+    if (!error) return;
+
+    const kolonne = manglendeKolonne(error);
+    if (!kolonne || !Object.prototype.hasOwnProperty.call(payload, kolonne)) throw error;
+    delete payload[kolonne];
+    if (!Object.keys(payload).length) return;
+  }
+}
+
+async function lagreProfil(
+  admin: any,
+  values: { authUserId: string; firmaId: string; epost: string; navn: string },
+) {
+  // Ulike installasjoner kan ha litt forskjellige kolonnenavn. Vi prøver de vanligste.
+  let payload: Record<string, unknown> = {
+    auth_user_id: values.authUserId,
+    firma_id: values.firmaId,
+    epost: values.epost,
+    navn: values.navn,
+    rolle: "hovslager",
+  };
+
+  for (let forsok = 0; forsok < 10; forsok++) {
+    const { error } = await admin
+      .from("hov_profiles")
+      .upsert(payload, { onConflict: "auth_user_id" });
+
+    if (!error) return;
+
+    // Hvis auth_user_id ikke er konfliktkolonne i denne installasjonen, prøv vanlig lookup/update.
+    const message = String(error.message || "").toLowerCase();
+    if (message.includes("on conflict") || message.includes("unique") || message.includes("constraint")) {
+      const { data: eksisterende, error: lookupError } = await admin
+        .from("hov_profiles")
+        .select("*")
+        .eq("epost", values.epost)
+        .limit(1)
+        .maybeSingle();
+
+      if (!lookupError && eksisterende?.id) {
+        const { error: updateError } = await admin
+          .from("hov_profiles")
+          .update(payload)
+          .eq("id", eksisterende.id);
+        if (!updateError) return;
+      }
+    }
+
+    const kolonne = manglendeKolonne(error);
+    if (!kolonne || !Object.prototype.hasOwnProperty.call(payload, kolonne)) {
+      console.warn("Kunne ikke lagre hov_profiles:", error.message);
+      return;
+    }
+    delete payload[kolonne];
+  }
 }
 
 serve(async (req) => {
@@ -90,217 +194,178 @@ serve(async (req) => {
   }
 
   try {
-    const SUPABASE_URL =
-      Deno.env.get("SUPABASE_URL") ||
-      Deno.env.get("APP_SUPABASE_URL");
-
-    const SERVICE_ROLE_KEY =
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") || Deno.env.get("APP_SUPABASE_URL");
+    const serviceRoleKey =
       Deno.env.get("SERVICE_ROLE_KEY") ||
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ||
       Deno.env.get("APP_SERVICE_ROLE_KEY");
 
-    if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
-      return json({
-        ok: false,
-        error: "Mangler SUPABASE_URL/APP_SUPABASE_URL eller SERVICE_ROLE_KEY/SUPABASE_SERVICE_ROLE_KEY/APP_SERVICE_ROLE_KEY.",
-      }, 500);
+    if (!supabaseUrl || !serviceRoleKey) {
+      return json({ ok: false, error: "Mangler Supabase URL eller service-role key." }, 500);
     }
 
-    const supabaseAdmin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-      },
+    const admin = createClient(supabaseUrl, serviceRoleKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
     });
 
     const body = await req.json().catch(() => ({}));
-
+    const mode = String(body.mode || "opprett").trim().toLowerCase();
+    const firmaId = String(body.firma_id || body.firmaId || "").trim();
     const navn = String(body.navn || body.firmanavn || "").trim();
     const epost = String(body.epost || body.email || "").trim().toLowerCase();
-    const passord = String(body.passord || body.password || "").trim();
-    const linknavn = slugify(String(body.linknavn || body.slug || navn || epost.split("@")[0] || "kunde"));
+    const redirectTo = String(body.redirect_to || body.redirectTo || "").trim();
+    const requestedLinknavn = String(body.linknavn || body.slug || "").trim();
 
-    if (!navn) {
-      return json({ ok: false, error: "Mangler navn/firmanavn." }, 400);
+    if (!epost) return json({ ok: false, error: "Mangler e-post." }, 400);
+    if (!["opprett", "send_invite_pa_nytt"].includes(mode)) {
+      return json({ ok: false, error: `Ukjent mode: ${mode}` }, 400);
     }
 
-    if (!epost) {
-      return json({ ok: false, error: "Mangler e-post." }, 400);
-    }
+    const forelopigLinknavn = slugify(requestedLinknavn || navn || epost.split("@")[0] || "kunde");
+    let eksisterendeFirma = await finnFirma(admin, firmaId, epost, forelopigLinknavn);
 
-    if (!passord || passord.length < 6) {
-      return json({ ok: false, error: "Mangler passord, eller passordet er kortere enn 6 tegn." }, 400);
-    }
-
-    // 1. Sjekk om firma allerede finnes på e-post eller linknavn.
-    const { data: eksisterendeFirma, error: firmaLookupError } = await supabaseAdmin
-      .from("hov_firma")
-      .select("*")
-      .or(`epost.ilike.${epost},linknavn.eq.${linknavn}`)
-      .limit(1)
-      .maybeSingle();
-
-    if (firmaLookupError) {
-      throw firmaLookupError;
-    }
-
-    let authUserId: string | null = null;
-    let authEksisterte = false;
-    let firmaEksisterte = !!eksisterendeFirma;
-
-    // 2. Opprett Auth-bruker, men ikke feil hvis den finnes.
-    const opprettAuth = await supabaseAdmin.auth.admin.createUser({
-      email: epost,
-      password: passord,
-      email_confirm: true,
-      user_metadata: {
-        navn,
-        app: "hovslager",
-        linknavn,
-      },
-    });
-
-    if (opprettAuth.error) {
-      const msg = String(opprettAuth.error.message || "").toLowerCase();
-
-      if (
-        msg.includes("already") ||
-        msg.includes("registered") ||
-        msg.includes("exists") ||
-        msg.includes("user already")
-      ) {
-        authEksisterte = true;
-        authUserId = await finnAuthUserId(supabaseAdmin, epost);
-      } else {
-        throw opprettAuth.error;
-      }
-    } else {
-      authUserId = opprettAuth.data?.user?.id || null;
-    }
-
-    // 3. Hvis firma finnes, oppdater manglende auth_user_id/linknavn hvis mulig, returner OK.
-    if (eksisterendeFirma?.id) {
-      let payload: Record<string, unknown> = {
-        navn: eksisterendeFirma.navn || navn,
-        epost: eksisterendeFirma.epost || epost,
-        linknavn: eksisterendeFirma.linknavn || linknavn,
-        auth_user_id: eksisterendeFirma.auth_user_id || authUserId,
-        rolle: eksisterendeFirma.rolle || "admin",
-        er_admin: eksisterendeFirma.er_admin ?? true,
-      };
-
-      let oppdatertFirma = eksisterendeFirma;
-
-      for (let forsok = 0; forsok < 8; forsok++) {
-        const { data, error } = await supabaseAdmin
-          .from("hov_firma")
-          .update(payload)
-          .eq("id", eksisterendeFirma.id)
-          .select("*")
-          .maybeSingle();
-
-        if (!error) {
-          oppdatertFirma = data || eksisterendeFirma;
-          break;
-        }
-
-        if (!fjernManglendeKolonne(payload, error)) {
-          console.warn("Kunne ikke oppdatere eksisterende firma:", error.message);
-          break;
-        }
-      }
-
+    if (mode === "send_invite_pa_nytt" && !eksisterendeFirma) {
       return json({
-        ok: true,
-        eksisterer: true,
-        melding: "Hovslagerkunde finnes allerede. Returnerer eksisterende firma.",
-        firma_id: oppdatertFirma.id,
-        firma: oppdatertFirma,
-        auth_user_id: authUserId || oppdatertFirma.auth_user_id || null,
-        auth_eksisterte: authEksisterte,
-        firma_eksisterte: firmaEksisterte,
-        linknavn: oppdatertFirma.linknavn || linknavn,
-        kundelink: `/hovslager/?firma=${encodeURIComponent(oppdatertFirma.linknavn || linknavn)}`,
+        ok: false,
+        error: "Fant ikke firmaet. Lagre firmaet før du sender invitasjonen på nytt.",
+      }, 404);
+    }
+
+    const faktiskNavn = navn || eksisterendeFirma?.navn || "HOVslager-bruker";
+    const faktiskLinknavn = slugify(
+      requestedLinknavn || eksisterendeFirma?.linknavn || faktiskNavn || epost.split("@")[0],
+    );
+
+    // Ved vanlig opprettelse lagres firmaet først. Da kan firma-ID legges i Auth-metadata.
+    let lagretFirma = eksisterendeFirma;
+    if (mode === "opprett") {
+      if (!navn && !eksisterendeFirma?.navn) {
+        return json({ ok: false, error: "Mangler navn/firmanavn." }, 400);
+      }
+      lagretFirma = await lagreFirma(admin, eksisterendeFirma, {
+        navn: faktiskNavn,
+        epost,
+        linknavn: faktiskLinknavn,
+      });
+      eksisterendeFirma = lagretFirma;
+    }
+
+    let authUser = await finnAuthBruker(admin, epost);
+    let slettetUaktivertBruker = false;
+
+    if (mode === "send_invite_pa_nytt" && authUser) {
+      const erAktivert = Boolean(authUser.email_confirmed_at || authUser.confirmed_at);
+      if (erAktivert) {
+        const { error: recoveryError } = await admin.auth.resetPasswordForEmail(
+          epost,
+          redirectTo ? { redirectTo } : undefined,
+        );
+        if (recoveryError) throw recoveryError;
+        return json({
+          ok: true,
+          bruker_aktivert: true,
+          recovery_sendt: true,
+          auth_user_id: authUser.id,
+          firma_id: eksisterendeFirma?.id || null,
+          melding: "Brukeren finnes allerede. E-post for gjenoppretting av passord er sendt.",
+        });
+      }
+
+      const { error: deleteError } = await admin.auth.admin.deleteUser(authUser.id);
+      if (deleteError) throw deleteError;
+      slettetUaktivertBruker = true;
+      authUser = null;
+    }
+
+    let invitasjonSendt = false;
+    let authUserId: string | null = authUser?.id || null;
+
+    if (!authUser) {
+      const options: Record<string, unknown> = {
+        data: {
+          navn: faktiskNavn,
+          app: "hovslager",
+          linknavn: faktiskLinknavn,
+          firma_id: eksisterendeFirma?.id || null,
+          rolle: "hovslager",
+        },
+      };
+      if (redirectTo) options.redirectTo = redirectTo;
+
+      const { data, error } = await admin.auth.admin.inviteUserByEmail(epost, options as any);
+
+      console.log("inviteUserByEmail", {
+        mode,
+        epost,
+        firmaId: eksisterendeFirma?.id || null,
+        redirectTo: redirectTo || null,
+        userId: data?.user?.id || null,
+        error: error?.message || null,
+      });
+
+      if (error) {
+        const { error: recoveryError } = await admin.auth.resetPasswordForEmail(
+          epost,
+          redirectTo ? { redirectTo } : undefined,
+        );
+        if (recoveryError) throw error;
+        return json({
+          ok: true,
+          recovery_sendt: true,
+          firma_id: eksisterendeFirma?.id || null,
+          melding: "Invitasjon kunne ikke brukes. E-post for gjenoppretting av passord er sendt.",
+        });
+      }
+      authUserId = data?.user?.id || null;
+      invitasjonSendt = true;
+    }
+
+    if (!eksisterendeFirma?.id) {
+      throw new Error("Firmaet mangler etter lagring.");
+    }
+
+    await oppdaterFirmaAuthId(admin, eksisterendeFirma.id, authUserId);
+
+    if (authUserId) {
+      await lagreProfil(admin, {
+        authUserId,
+        firmaId: eksisterendeFirma.id,
+        epost,
+        navn: faktiskNavn,
       });
     }
 
-    // 4. Opprett nytt firma.
-    let payload: Record<string, unknown> = {
-      navn,
-      epost,
-      linknavn,
-      auth_user_id: authUserId,
-      rolle: "admin",
-      er_admin: true,
-    };
+    // Hent oppdatert firma for korrekt retur.
+    const { data: oppdatertFirma } = await admin
+      .from("hov_firma")
+      .select("*")
+      .eq("id", eksisterendeFirma.id)
+      .maybeSingle();
 
-    let nyFirma: any = null;
-
-    for (let forsok = 0; forsok < 8; forsok++) {
-      const { data, error } = await supabaseAdmin
-        .from("hov_firma")
-        .insert([payload])
-        .select("*")
-        .maybeSingle();
-
-      if (!error) {
-        nyFirma = data;
-        break;
-      }
-
-      // Hvis unik-konflikt skjer mellom lookup og insert, hent eksisterende og returner OK.
-      const msg = String(error.message || "").toLowerCase();
-      const code = String((error as any).code || "");
-      if (code === "23505" || msg.includes("duplicate") || msg.includes("unique")) {
-        const { data: firmaEtterKonflikt } = await supabaseAdmin
-          .from("hov_firma")
-          .select("*")
-          .or(`epost.ilike.${epost},linknavn.eq.${linknavn}`)
-          .limit(1)
-          .maybeSingle();
-
-        if (firmaEtterKonflikt?.id) {
-          return json({
-            ok: true,
-            eksisterer: true,
-            melding: "Hovslagerkunde fantes allerede ved lagring. Returnerer eksisterende firma.",
-            firma_id: firmaEtterKonflikt.id,
-            firma: firmaEtterKonflikt,
-            auth_user_id: authUserId || firmaEtterKonflikt.auth_user_id || null,
-            auth_eksisterte: authEksisterte,
-            firma_eksisterte: true,
-            linknavn: firmaEtterKonflikt.linknavn || linknavn,
-            kundelink: `/hovslager/?firma=${encodeURIComponent(firmaEtterKonflikt.linknavn || linknavn)}`,
-          });
-        }
-      }
-
-      if (!fjernManglendeKolonne(payload, error)) {
-        throw error;
-      }
-    }
-
-    if (!nyFirma?.id) {
-      throw new Error("Kunne ikke opprette hov_firma.");
-    }
+    const firma = oppdatertFirma || eksisterendeFirma;
 
     return json({
       ok: true,
-      eksisterer: false,
-      melding: "Hovslagerkunde opprettet.",
-      firma_id: nyFirma.id,
-      firma: nyFirma,
+      mode,
+      melding: mode === "send_invite_pa_nytt"
+        ? "Ny invitasjon er sendt på e-post."
+        : invitasjonSendt
+        ? "Firmaet er lagret og invitasjonen er sendt på e-post."
+        : "Firmaet er lagret. Brukeren finnes allerede i Auth, så ny invitasjon ble ikke sendt.",
+      invitasjon_sendt: invitasjonSendt,
+      slettet_uaktivert_bruker: slettetUaktivertBruker,
+      auth_bruker_eksisterte: Boolean(authUser),
       auth_user_id: authUserId,
-      auth_eksisterte: authEksisterte,
-      firma_eksisterte: false,
-      linknavn: nyFirma.linknavn || linknavn,
-      kundelink: `/hovslager/?firma=${encodeURIComponent(nyFirma.linknavn || linknavn)}`,
+      firma_id: firma.id,
+      firma,
+      linknavn: firma.linknavn || faktiskLinknavn,
+      kundelink: `/hovslager/?firma=${encodeURIComponent(firma.linknavn || faktiskLinknavn)}`,
     });
-  } catch (e) {
-    console.error("opprett-hov-kunde feil:", e);
+  } catch (error) {
+    console.error("opprett-hov-kunde feil:", error);
     return json({
       ok: false,
-      error: String((e as any)?.message || e),
+      error: String((error as any)?.message || error),
     }, 500);
   }
 });
