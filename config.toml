@@ -425,3 +425,27 @@ entrypoint = "./functions/opprett-vet-bruker/index.ts"
 
 [functions.auto-vet-backup]
 verify_jwt = false
+
+[functions.vet-glemt-passord]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/vet-glemt-passord/index.ts"
+
+[functions.slett-vet-administrasjon]
+enabled = true
+verify_jwt = true
+entrypoint = "./functions/slett-vet-administrasjon/index.ts"
+
+[functions.vet-geocode-adresse]
+enabled = true
+verify_jwt = true
+entrypoint = "./functions/vet-geocode-adresse/index.ts"
+
+[functions.vet-regnskap]
+enabled = true
+# Funksjonen validerer JWT og adminrollen selv. Dette gir lesbare JSON-feil
+# også når plattformens innebygde JWT-kontroll ikke godtar nyere tokenformat.
+verify_jwt = false
+entrypoint = "./functions/vet-regnskap/index.ts"
+[functions.poweroffice]
+verify_jwt = false

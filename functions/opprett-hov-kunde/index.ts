@@ -250,25 +250,24 @@ serve(async (req) => {
       eksisterendeFirma = lagretFirma;
     }
 
-    let authUser = await finnAuthBruker(admin, epost);
+    // Vanlig opprettelse skal ikke skanne hele Auth-registeret først.
+    // Det kunne ta lenge og fikk demosiden til å se ut som den hang.
+    // Ved ny invitasjon må vi fortsatt slå opp eksisterende bruker.
+    let authUser = mode === "send_invite_pa_nytt"
+      ? await finnAuthBruker(admin, epost)
+      : null;
     let slettetUaktivertBruker = false;
 
     if (mode === "send_invite_pa_nytt" && authUser) {
       const erAktivert = Boolean(authUser.email_confirmed_at || authUser.confirmed_at);
       if (erAktivert) {
-        const { error: recoveryError } = await admin.auth.resetPasswordForEmail(
-          epost,
-          redirectTo ? { redirectTo } : undefined,
-        );
-        if (recoveryError) throw recoveryError;
         return json({
-          ok: true,
+          ok: false,
           bruker_aktivert: true,
-          recovery_sendt: true,
           auth_user_id: authUser.id,
           firma_id: eksisterendeFirma?.id || null,
-          melding: "Brukeren finnes allerede. E-post for gjenoppretting av passord er sendt.",
-        });
+          error: "Brukeren er allerede aktivert. Bruk glemt passord i stedet for ny invitasjon.",
+        }, 409);
       }
 
       const { error: deleteError } = await admin.auth.admin.deleteUser(authUser.id);
@@ -303,19 +302,7 @@ serve(async (req) => {
         error: error?.message || null,
       });
 
-      if (error) {
-        const { error: recoveryError } = await admin.auth.resetPasswordForEmail(
-          epost,
-          redirectTo ? { redirectTo } : undefined,
-        );
-        if (recoveryError) throw error;
-        return json({
-          ok: true,
-          recovery_sendt: true,
-          firma_id: eksisterendeFirma?.id || null,
-          melding: "Invitasjon kunne ikke brukes. E-post for gjenoppretting av passord er sendt.",
-        });
-      }
+      if (error) throw error;
       authUserId = data?.user?.id || null;
       invitasjonSendt = true;
     }

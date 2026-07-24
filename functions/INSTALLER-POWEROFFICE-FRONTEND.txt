@@ -1,0 +1,8 @@
+POWEROFFICE - FERDIG FRONTEND
+
+1. Kopier alle filer i denne pakken over webmappen.
+2. Behold Supabase secrets og den deployede poweroffice-funksjonen.
+3. Oppdater nettleseren med Ctrl+F5.
+4. Velg PowerOffice Go. Ingen firma-ID eller Edge Function-URL skal fylles ut.
+5. Trykk Test PowerOffice.
+6. Gå til Faktura og bruk Send til PowerOffice.

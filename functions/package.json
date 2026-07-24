@@ -1,0 +1,6 @@
+{
+  "name": "rett-i-lomma-hovslager-demo",
+  "private": true,
+  "version": "2.4.0",
+  "engines": { "node": ">=20" }
+}

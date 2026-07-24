@@ -1,0 +1,2 @@
+[functions.poweroffice]
+verify_jwt = false

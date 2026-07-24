@@ -1,0 +1,17 @@
+RETT I LOMMA - POWEROFFICE KUNDEFIKS
+
+Denne pakken inneholder hele prosjektet.
+
+Rettet:
+- PowerOffice-kunden sendes med Name, FirstName og LastName.
+- Ettordsnavn får LastName = Kunde.
+- Fakturasiden viser Test PowerOffice når PowerOffice er valgt.
+- Frontend bruker direkte fetch til deployet PowerOffice Edge Function.
+
+Etter utpakking, deploy funksjonen på nytt:
+
+cd C:\inetpub\wwwroot\rettilomma
+supabase functions deploy poweroffice --project-ref yxzdwrstpfxvxnbswyjf --no-verify-jwt
+
+Du trenger ikke kjore db push.
+Oppdater nettleseren med Ctrl+Shift+R.

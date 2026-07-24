@@ -1,0 +1,9 @@
+POWEROFFICE FRONTEND - ENDELIG RETTING
+
+1. Pakk ut hele innholdet over C:\inetpub\wwwroot\rettilomma\hovslager\
+2. Kontroller at undermappen js og filen js\integration-core.js blir overskrevet.
+3. I Chrome: trykk F12, Application, Service Workers, Unregister (dersom en worker finnes).
+4. Trykk Ctrl+Shift+R.
+5. Velg PowerOffice Go og trykk Lagre systemvalg.
+
+For PowerOffice skjules Firma-ID og Backend URL automatisk. Testknappen bruker Supabase-funksjonen poweroffice direkte.

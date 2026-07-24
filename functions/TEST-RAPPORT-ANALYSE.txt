@@ -1,0 +1,11 @@
+Alle kontroller bestatt:
+- index_brand_hovslager: OK
+- index_has_analysis_button: OK
+- css_forces_button_visible: OK
+- editor_has_line: OK
+- editor_has_angle: OK
+- editor_has_canvas: OK
+- iphone_touch_support: OK
+- delegated_click_capture: OK
+- cache_busting: OK
+JavaScript syntax kontrollert med node --check.

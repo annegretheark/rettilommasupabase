@@ -1,0 +1,63 @@
+/* Seamless mobile layer - keeps existing angles, borders and visual lines intact */
+html{width:100%;max-width:100%;overflow-x:hidden;scroll-padding-top:150px}
+body{width:100%;max-width:100%;overflow-x:hidden;min-height:100dvh;padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}
+img,svg,canvas,video,iframe{max-width:100%;height:auto}
+button,a,input,select,textarea{max-width:100%}
+.wrap,.card,.grid,.formgrid,.topbar,.main-tabs,main,section{min-width:0}
+.card{isolation:isolate}
+.table-scroll,[class*="table-wrap"],#adminFirmaList,#fakturaList,#kundeList,#hestList,#jobbList,#prisList,#appFakturaList{max-width:100%}
+
+@media(max-width:800px){
+  :root{--mobile-gap:10px;--mobile-radius:14px;--mobile-header-offset:0px}
+  html{scroll-padding-top:132px}
+  body{overflow-wrap:anywhere}
+  .wrap{width:100%;max-width:100%;padding:8px max(8px,env(safe-area-inset-right)) calc(18px + env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left))!important}
+  .card{width:100%;max-width:100%;margin:10px 0!important;padding:12px!important;border-width:1px!important;overflow:visible}
+  .topbar{position:relative!important;top:auto!important;margin:0 0 8px!important;padding:10px!important}
+  .brand{display:grid!important;grid-template-columns:auto minmax(0,1fr)!important;width:100%;gap:10px!important;align-items:center!important}
+  .brand>div,.brand h1,.brand p{min-width:0;max-width:100%}
+  .brand h1{overflow-wrap:anywhere}
+  .userline{width:100%;min-width:0}
+  .userline>*{min-width:0}
+  .pill{max-width:100%;overflow:hidden;text-overflow:ellipsis}
+
+  .main-tabs,.tabs{position:sticky!important;top:0!important;z-index:80!important;width:100%!important;max-width:100%!important;margin:0 0 10px!important;padding:8px!important;background:rgba(15,23,42,.97)!important;border:1px solid var(--border)!important;border-radius:12px!important;box-shadow:0 8px 22px rgba(0,0,0,.22);backdrop-filter:blur(12px)}
+  .main-tabs{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:8px!important}
+  .main-tabs>button,.main-tabs>.nav-more,.main-tabs>.nav-more>summary,.tabs>button{min-width:0!important;width:100%!important;max-width:100%!important;white-space:normal!important;line-height:1.15!important}
+  .nav-more{position:relative!important}
+  .nav-more-menu{position:fixed!important;left:10px!important;right:10px!important;top:auto!important;bottom:calc(10px + env(safe-area-inset-bottom))!important;width:auto!important;min-width:0!important;max-height:min(70dvh,560px)!important;overflow:auto!important;overscroll-behavior:contain}
+
+  .grid,.formgrid,.shoe-layout,.shoe-details-grid,.shoe-size-grid{grid-template-columns:minmax(0,1fr)!important}
+  .grid>*,.formgrid>*,.shoe-layout>*,.shoe-details-grid>*,.shoe-size-grid>*{min-width:0;grid-column:1/-1!important}
+  input,select,textarea{width:100%!important;max-width:100%!important}
+  textarea{resize:vertical}
+  .actions{display:grid!important;grid-template-columns:minmax(0,1fr)!important;width:100%;gap:8px!important}
+  .actions>*{width:100%!important;min-width:0!important;white-space:normal!important}
+
+  table{max-width:none}
+  .table-scroll,[class*="table-wrap"]{overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior-inline:contain}
+  td,th{overflow-wrap:anywhere}
+
+  .calendar-toolbar,.gps-toolbar,.gps-card-head{align-items:stretch!important}
+  .calendar-toolbar>*{flex:1 1 100%;min-width:0}
+  .calendar-toolbar .calendar-title{order:-1;width:100%;min-width:0}
+  .calendar-grid{width:100%;grid-template-columns:repeat(7,minmax(0,1fr))!important}
+  .calendar-day{min-width:0;overflow:hidden}
+
+  .doc-modal-card{inset:max(6px,env(safe-area-inset-top)) max(6px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(6px,env(safe-area-inset-left))!important;width:auto!important;max-width:none!important}
+  .doc-modal-body{min-width:0!important;overflow:auto!important}
+  .hoof-editor-modal{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+  .hoof-editor-head,.hoof-editor-tools{min-width:0}
+  .hoof-editor-tools>*{min-width:0}
+
+  /* Preserve all existing geometry: borders, diagonal clips and separator lines are not removed. */
+  [style*="clip-path"],.angled,.angle,.diagonal{overflow:visible}
+}
+
+@media(max-width:420px){
+  .wrap{padding-left:6px!important;padding-right:6px!important}
+  .card{padding:10px!important}
+  .main-tabs{grid-template-columns:minmax(0,1fr) minmax(0,1fr)!important;gap:6px!important;padding:6px!important}
+  .main-tabs>button,.main-tabs>.nav-more>summary{font-size:13px!important;padding:9px 6px!important}
+  .calendar-day{min-height:70px!important;padding:4px!important}
+}

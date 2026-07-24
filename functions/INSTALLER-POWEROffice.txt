@@ -1,0 +1,7 @@
+1. Pakk ut hele ZIP-en over C:\inetpub\wwwroot\rettilomma\hovslager\
+2. Kopier supabase-mappen til C:\inetpub\wwwroot\rettilomma\supabase\ hvis prosjektet bruker supabase på rotnivå.
+3. Deploy funksjonen fra C:\inetpub\wwwroot\rettilomma:
+   supabase functions deploy poweroffice --project-ref yxzdwrstpfxvxnbswyjf --no-verify-jwt
+4. Oppdater nettleseren med Ctrl+Shift+R.
+
+Frontend bruker direkte fetch uten apikey/Authorization mot den deployede poweroffice-funksjonen.
